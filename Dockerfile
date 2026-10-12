@@ -8,7 +8,8 @@ RUN npm ci --omit=dev --ignore-scripts
 COPY src ./src
 
 # ---- Runtime stage: distroless = no shell, no package manager, only Node.js and the app
-FROM gcr.io/distroless/nodejs22-debian12:nonroot
+# Debian 13 base: the Debian 12 variant still carried fixable OpenSSL CVEs (1 critical, 5 high) found by Trivy
+FROM gcr.io/distroless/nodejs22-debian13:nonroot
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=8080

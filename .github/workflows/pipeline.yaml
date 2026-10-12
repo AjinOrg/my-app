@@ -1,0 +1,211 @@
+# my-app pipeline
+#   Pull request → checks only (no AWS access): secrets, lint + tests, dependencies, filesystem scan,
+#                  image build + Trivy, Kyverno policies against the platform's chart.
+#   Push to main → same checks, then push the image to ECR (GitHub OIDC, no keys) and open a deployment
+#                  pull request in AjinOrg/aws-platform (values-dev.yaml image.tag = commit SHA).
+# Any failing check stops everything after it: a vulnerable or non-compliant image never reaches ECR.
+name: my-app
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: my-app-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: 471112815218.dkr.ecr.ap-south-1.amazonaws.com/my-app
+  ECR_PUSH_ROLE: arn:aws:iam::471112815218:role/aws-platform-ecr-push # trusts only this repo's main branch
+  PLATFORM_OWNER: AjinOrg
+  PLATFORM_REPO: aws-platform
+  HELM_VERSION: v4.3.0
+  DEPENDENCY_CHECK_VERSION: "13.0.0"
+
+jobs:
+  gitleaks:
+    name: Secrets scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: bash .github/scripts/install-ci-tools.sh gitleaks
+      - run: gitleaks git --redact --verbose .
+
+  lint-test:
+    name: Lint + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  dependency-check:
+    name: Dependencies (npm audit + OWASP Dependency-Check)
+    runs-on: ubuntu-latest
+    env:
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: npm audit (high and critical fail)
+        run: npm audit --audit-level=high
+      - name: OWASP Dependency-Check database cache
+        if: env.NVD_API_KEY != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.odc-data
+          key: odc-${{ env.DEPENDENCY_CHECK_VERSION }}-${{ github.run_id }}
+          restore-keys: odc-${{ env.DEPENDENCY_CHECK_VERSION }}-
+      - name: OWASP Dependency-Check (CVSS >= 7 fails)
+        if: env.NVD_API_KEY != ''
+        run: |
+          mkdir -p ~/.odc-data odc-report
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD":/src -v "$HOME/.odc-data":/usr/share/dependency-check/data -v "$PWD/odc-report":/report \
+            -e NVD_API_KEY \
+            "owasp/dependency-check:${DEPENDENCY_CHECK_VERSION}" \
+            --scan /src --exclude "/src/odc-report/**" --project my-app \
+            --format HTML --format JSON --out /report \
+            --failOnCVSS 7 --nvdApiKey "$NVD_API_KEY" --disableYarnAudit --disablePnpmAudit
+      - name: OWASP Dependency-Check skipped
+        if: env.NVD_API_KEY == ''
+        run: echo "::warning::NVD_API_KEY secret not set - OWASP Dependency-Check skipped (npm audit still ran). Add the secret to enable it."
+      - if: always() && env.NVD_API_KEY != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: odc-report/
+          if-no-files-found: ignore
+
+  trivy-fs:
+    name: Filesystem scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/install-ci-tools.sh trivy
+      - name: vulnerabilities, secrets and Dockerfile misconfigurations
+        run: trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
+
+  image:
+    name: Build image + Trivy + Kyverno (+ push on main)
+    needs: [gitleaks, lint-test, dependency-check, trivy-fs]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # lets this job request a GitHub OIDC token for AWS (used only on main)
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+      - run: bash .github/scripts/install-ci-tools.sh trivy kyverno
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: build
+        run: docker build -t "$ECR_REPOSITORY:${{ steps.meta.outputs.tag }}" .
+
+      - name: Trivy image scan (HIGH/CRITICAL with a fix available fail)
+        run: trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ECR_REPOSITORY:${{ steps.meta.outputs.tag }}"
+
+      # The same policies the cluster enforces, applied to the platform's chart with THIS image
+      - name: checkout platform policies and chart
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_OWNER }}/${{ env.PLATFORM_REPO }}
+          path: platform
+      - name: Kyverno policies
+        run: |
+          for env in dev staging production; do
+            helm template my-app platform/helm/my-app -n "$env" \
+              -f "platform/gitops/apps/my-app/values-$env.yaml" \
+              --set image.tag="${{ steps.meta.outputs.tag }}" > "rendered-$env.yaml"
+            kyverno apply platform/policies/kyverno --resource "rendered-$env.yaml"
+          done
+
+      # ---- main only: publish
+      - name: AWS credentials (GitHub OIDC → role aws-platform-ecr-push, 1 hour)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ECR_PUSH_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: push to ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY%/*}"
+          # Tags are immutable: a re-run for the same commit must not fail
+          if aws ecr describe-images --repository-name my-app --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "Image $TAG already in ECR - not pushed again"
+          else
+            docker push "$ECR_REPOSITORY:$TAG"
+          fi
+          echo "### Image pushed: \`$ECR_REPOSITORY:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    name: Deployment pull request (dev)
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: GitHub App configured?
+        if: vars.PLATFORM_APP_ID == ''
+        run: |
+          echo "::warning::GitHub App not configured (variable PLATFORM_APP_ID, secret PLATFORM_APP_PRIVATE_KEY)."
+          echo "Deploy by hand: set image.tag to ${{ needs.image.outputs.tag }} in gitops/apps/my-app/values-dev.yaml of $PLATFORM_OWNER/$PLATFORM_REPO" >> "$GITHUB_STEP_SUMMARY"
+
+      # Short-lived (1 hour) token of a GitHub App that may only write to aws-platform: no personal token stored
+      - id: app-token
+        if: vars.PLATFORM_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PLATFORM_APP_ID }}
+          private-key: ${{ secrets.PLATFORM_APP_PRIVATE_KEY }}
+          owner: ${{ env.PLATFORM_OWNER }}
+          repositories: ${{ env.PLATFORM_REPO }}
+
+      - if: vars.PLATFORM_APP_ID != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_OWNER }}/${{ env.PLATFORM_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: open the pull request (auto-merges after platform-ci when allowed)
+        if: vars.PLATFORM_APP_ID != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.image.outputs.tag }}
+        run: |
+          FILE=gitops/apps/my-app/values-dev.yaml
+          BRANCH="deploy/my-app-dev-$TAG"
+          sed -i -E "s/^(  tag: ).*/\1\"$TAG\"/" "$FILE"
+          if git diff --quiet; then echo "dev already runs $TAG"; exit 0; fi
+          git config user.name "my-app-pipeline[bot]"
+          git config user.email "my-app-pipeline[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "deploy: my-app $TAG to dev"
+          git push origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "deploy: my-app $TAG to dev" \
+            --body "Image \`$ECR_REPOSITORY:$TAG\` (scanned by Trivy, Kyverno policies passed) from ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+          gh pr merge "$BRANCH" --auto --squash || echo "::notice::auto-merge not enabled on $PLATFORM_REPO; merge the PR by hand"
