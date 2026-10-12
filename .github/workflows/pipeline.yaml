@@ -1,8 +1,9 @@
 # my-app pipeline
-#   Pull request → checks only (no AWS access): secrets, lint + tests, dependencies, filesystem scan,
-#                  image build + Trivy, Kyverno policies against the platform's chart.
+#   Pull request → checks only (no AWS access): secrets, lint + tests + coverage, SonarQube Cloud quality gate,
+#                  dependencies, filesystem scan, image build + Trivy, Kyverno policies against the platform's chart.
 #   Push to main → same checks, then push the image to ECR (GitHub OIDC, no keys) and open a deployment
-#                  pull request in AjinOrg/aws-platform (values-dev.yaml image.tag = commit SHA).
+#                  pull request in AjinOrg/aws-platform (values-dev.yaml image.tag = commit SHA) that merges
+#                  itself once platform-ci passes. Staging/production: released on purpose (aws-platform release.yaml).
 # Any failing check stops everything after it: a vulnerable or non-compliant image never reaches ECR.
 name: my-app
 
@@ -51,7 +52,36 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - run: npm test
+      - run: npm run test:coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/lcov.info
+
+  sonar:
+    name: Code quality (SonarQube Cloud)
+    needs: lint-test
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: Sonar tells new code from old code (blame)
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage
+      - name: SonarQube Cloud scan + quality gate
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v5
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+      - name: SonarQube Cloud skipped
+        if: env.SONAR_TOKEN == ''
+        run: echo "::warning::SONAR_TOKEN secret not set - SonarQube Cloud analysis skipped."
 
   dependency-check:
     name: Dependencies (npm audit + OWASP Dependency-Check)
@@ -105,7 +135,7 @@ jobs:
 
   image:
     name: Build image + Trivy + Kyverno (+ push on main)
-    needs: [gitleaks, lint-test, dependency-check, trivy-fs]
+    needs: [gitleaks, lint-test, sonar, dependency-check, trivy-fs]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -167,6 +197,10 @@ jobs:
     needs: image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # One deployment PR at a time: later pushes wait, and the newest tag wins (older open PRs are closed)
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
     steps:
       - name: GitHub App configured?
         if: vars.PLATFORM_APP_ID == ''
@@ -174,7 +208,8 @@ jobs:
           echo "::warning::GitHub App not configured (variable PLATFORM_APP_ID, secret PLATFORM_APP_PRIVATE_KEY)."
           echo "Deploy by hand: set image.tag to ${{ needs.image.outputs.tag }} in gitops/apps/my-app/values-dev.yaml of $PLATFORM_OWNER/$PLATFORM_REPO" >> "$GITHUB_STEP_SUMMARY"
 
-      # Short-lived (1 hour) token of a GitHub App that may only write to aws-platform: no personal token stored
+      # Short-lived (1 hour) token of a GitHub App that may only write to aws-platform: no personal token stored.
+      # PRs opened with it also trigger platform-ci (PRs opened with GITHUB_TOKEN would not).
       - id: app-token
         if: vars.PLATFORM_APP_ID != ''
         uses: actions/create-github-app-token@v2
@@ -190,22 +225,38 @@ jobs:
           repository: ${{ env.PLATFORM_OWNER }}/${{ env.PLATFORM_REPO }}
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: open the pull request (auto-merges after platform-ci when allowed)
+      - name: open the dev pull request (merges itself when platform-ci passes; no approval needed for dev)
         if: vars.PLATFORM_APP_ID != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ needs.image.outputs.tag }}
         run: |
           FILE=gitops/apps/my-app/values-dev.yaml
-          BRANCH="deploy/my-app-dev-$TAG"
+          BRANCH="deploy/dev/my-app-$TAG"
+          REPO="$PLATFORM_OWNER/$PLATFORM_REPO"
+
+          # Newest tag wins: close dev deployment PRs that are still open for older tags
+          for old in $(gh pr list -R "$REPO" --state open --json headRefName \
+                         --jq '.[].headRefName | select(startswith("deploy/dev/my-app-"))'); do
+            [ "$old" = "$BRANCH" ] && continue
+            gh pr close "$old" -R "$REPO" --delete-branch --comment "Superseded by my-app $TAG"
+          done
+
           sed -i -E "s/^(  tag: ).*/\1\"$TAG\"/" "$FILE"
           if git diff --quiet; then echo "dev already runs $TAG"; exit 0; fi
-          git config user.name "my-app-pipeline[bot]"
-          git config user.email "my-app-pipeline[bot]@users.noreply.github.com"
+          # Commit as the GitHub App's own bot account, so every commit is attributed to the app
+          SLUG="${{ steps.app-token.outputs.app-slug }}"
+          BOT_ID=$(gh api "users/${SLUG}%5Bbot%5D" --jq .id)
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${BOT_ID}+${SLUG}[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git commit -am "deploy: my-app $TAG to dev"
-          git push origin "$BRANCH"
-          gh pr create --base main --head "$BRANCH" \
-            --title "deploy: my-app $TAG to dev" \
-            --body "Image \`$ECR_REPOSITORY:$TAG\` (scanned by Trivy, Kyverno policies passed) from ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
-          gh pr merge "$BRANCH" --auto --squash || echo "::notice::auto-merge not enabled on $PLATFORM_REPO; merge the PR by hand"
+          git commit -am "deploy(dev): my-app $TAG"
+          git push --force origin "$BRANCH"
+          gh pr create -R "$REPO" --base main --head "$BRANCH" \
+            --title "deploy(dev): my-app $TAG" \
+            --body "Automatic dev deployment of \`$ECR_REPOSITORY:$TAG\`.
+          Checks passed in my-app: Gitleaks, tests, SonarQube Cloud, dependencies, Trivy (fs + image), Kyverno.
+          Source: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          Merges itself when platform-ci passes. After the sync, verify.yaml smoke-tests dev. Staging is released on purpose (release.yaml)."
+          gh pr merge "$BRANCH" -R "$REPO" --auto --squash --delete-branch
+          echo "### Dev deployment PR opened for \`$TAG\` (auto-merge)" >> "$GITHUB_STEP_SUMMARY"

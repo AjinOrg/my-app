@@ -47,8 +47,12 @@ docker run --rm -p 8080:8080 --read-only --cap-drop ALL my-app:local
 
 ## How a change reaches the cluster
 ```
-push to main → pipeline: lint, test, scans → build image (tag = commit SHA) → Trivy → push to ECR
-            → pull request in aws-platform: gitops/apps/my-app/values-dev.yaml image.tag = <sha>
-            → merged → ArgoCD deploys to dev → promoted to staging → production (approval)
+PR to main   → checks: Gitleaks, lint, tests + coverage, SonarQube Cloud quality gate, npm audit / OWASP,
+               Trivy (fs + image), Kyverno  → must be green to merge
+merge to main → same checks → image pushed to ECR (tag = 7-char commit SHA, GitHub OIDC)
+             → dev:        PR in aws-platform merges itself after platform-ci, then smoke-tested (automatic)
+             → staging:    a person starts the release (form or menu) and picks a tag that ran in dev
+             → production: a person starts the release, picks a tag that ran in staging, and a Code Owner approves
 ```
-The pipeline is added on Day 6. Until then the image is built and pushed by hand (see the platform README).
+Details: `AjinOrg/aws-platform` README, "Step 11: Continuous Delivery". Run the tests with coverage locally:
+`npm run test:coverage` (writes `coverage/lcov.info`, the file SonarQube Cloud reads).
