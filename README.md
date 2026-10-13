@@ -56,3 +56,4 @@ merge to main → same checks → image pushed to ECR (tag = 7-char commit SHA, 
 ```
 Details: `AjinOrg/aws-platform` README, "Step 11: Continuous Delivery". Run the tests with coverage locally:
 `npm run test:coverage` (writes `coverage/lcov.info`, the file SonarQube Cloud reads).
+<-- dev A 08:39:23 -->
