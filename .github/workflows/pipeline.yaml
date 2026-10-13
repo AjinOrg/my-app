@@ -206,7 +206,9 @@ jobs:
   deploy-dev:
     name: Deployment pull request (dev)
     needs: image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Explicit status check: without it GitHub adds success(), which is false because the check jobs before
+    # "image" are skipped on main. Run only when the image job itself succeeded.
+    if: ${{ !cancelled() && needs.image.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     # One deployment PR at a time: later pushes wait, and the newest tag wins (older open PRs are closed)
     concurrency:
