@@ -1,9 +1,12 @@
 # my-app pipeline
-#   Pull request → checks only (no AWS access): secrets, lint + tests + coverage, SonarQube Cloud quality gate,
+#   Pull request → ALL checks (no AWS access): secrets, lint + tests + coverage, SonarQube Cloud quality gate,
 #                  dependencies, filesystem scan, image build + Trivy, Kyverno policies against the platform's chart.
-#   Push to main → same checks, then push the image to ECR (GitHub OIDC, no keys) and open a deployment
-#                  pull request in AjinOrg/aws-platform (values-dev.yaml image.tag = commit SHA) that merges
-#                  itself once platform-ci passes. Staging/production: released on purpose (aws-platform release.yaml).
+#                  The ruleset requires the branch to be up to date with main, so the checked code is exactly
+#                  what main becomes.
+#   Push to main → lighter run: build, Trivy image (a CVE may have been published since the PR), Kyverno, push to
+#                  ECR (GitHub OIDC, no keys), then a deployment pull request in AjinOrg/aws-platform
+#                  (values-dev.yaml image.tag = commit SHA) that merges itself once platform-ci passes.
+#   Staging/production: released on purpose (aws-platform release.yaml).
 # Any failing check stops everything after it: a vulnerable or non-compliant image never reaches ECR.
 name: my-app
 
@@ -33,6 +36,7 @@ env:
 jobs:
   gitleaks:
     name: Secrets scan (Gitleaks)
+    if: github.event_name == 'pull_request' # checks run on PRs (branch must be up to date with main)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +47,7 @@ jobs:
 
   lint-test:
     name: Lint + unit tests
+    if: github.event_name == 'pull_request' # checks run on PRs (branch must be up to date with main)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +65,7 @@ jobs:
 
   sonar:
     name: Code quality (SonarQube Cloud)
+    if: github.event_name == 'pull_request' # checks run on PRs (branch must be up to date with main)
     needs: lint-test
     runs-on: ubuntu-latest
     env:
@@ -85,6 +91,7 @@ jobs:
 
   dependency-check:
     name: Dependencies (npm audit + OWASP Dependency-Check)
+    if: github.event_name == 'pull_request' # checks run on PRs (branch must be up to date with main)
     runs-on: ubuntu-latest
     env:
       NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
@@ -126,6 +133,7 @@ jobs:
 
   trivy-fs:
     name: Filesystem scan (Trivy)
+    if: github.event_name == 'pull_request' # checks run on PRs (branch must be up to date with main)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -136,6 +144,9 @@ jobs:
   image:
     name: Build image + Trivy + Kyverno (+ push on main)
     needs: [gitleaks, lint-test, sonar, dependency-check, trivy-fs]
+    # PR: all checks must succeed. main: the checks are skipped (they passed on the up-to-date PR), so run unless
+    # a needed job failed or was cancelled
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
