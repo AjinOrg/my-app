@@ -19,4 +19,5 @@ module.exports = [
     },
   },
 ];
-<-- dev B 08:40:41 -->
+
+<!-- dev B $(date -u +%T) -->
