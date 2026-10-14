@@ -43,7 +43,10 @@ jobs:
         with:
           fetch-depth: 0
       - run: bash .github/scripts/install-ci-tools.sh gitleaks
-      - run: gitleaks git --redact --verbose .
+      # Only the history of the checked commit (PR: main + the PR's commits). Without --log-opts gitleaks runs
+      # "git log --all" and fetch-depth 0 fetched every branch, so a secret on ANY branch (e.g. the demo branch
+      # demo/ci-failures) would fail every PR
+      - run: gitleaks git --redact --verbose --log-opts="HEAD" .
 
   lint-test:
     name: Lint + unit tests
