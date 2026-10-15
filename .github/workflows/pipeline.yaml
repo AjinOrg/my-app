@@ -1,12 +1,13 @@
 # my-app pipeline
 #   Pull request → ALL checks (no AWS access): secrets, lint + tests + coverage, SonarQube Cloud quality gate,
-#                  dependencies, filesystem scan, image build + Trivy, Kyverno policies against the platform's chart.
+#                  dependencies, filesystem scan, image build + Trivy, Kyverno: the platform's policies against the
+#                  shared chart with my-app's values (AjinOrg/helm-chart).
 #                  The ruleset requires the branch to be up to date with main, so the checked code is exactly
 #                  what main becomes.
 #   Push to main → lighter run: build, Trivy image (a CVE may have been published since the PR), Kyverno, push to
-#                  ECR (GitHub OIDC, no keys), then a deployment pull request in AjinOrg/aws-platform
-#                  (values-dev.yaml image.tag = commit SHA) that merges itself once platform-ci passes.
-#   Staging/production: released on purpose (aws-platform release.yaml).
+#                  ECR (GitHub OIDC, no keys), then a deployment pull request in AjinOrg/helm-chart
+#                  (apps/my-app/values-dev.yaml image.tag = commit SHA) that merges itself once its ci passes.
+#   Staging/production: released on purpose (helm-chart release.yaml, release team).
 # Any failing check stops everything after it: a vulnerable or non-compliant image never reaches ECR.
 name: my-app
 
@@ -29,7 +30,9 @@ env:
   ECR_REPOSITORY: 471112815218.dkr.ecr.ap-south-1.amazonaws.com/my-app
   ECR_PUSH_ROLE: arn:aws:iam::471112815218:role/aws-platform-ecr-push # trusts only this repo's main branch
   PLATFORM_OWNER: AjinOrg
-  PLATFORM_REPO: aws-platform
+  PLATFORM_REPO: aws-platform # Kyverno policies (infra team)
+  DEPLOY_REPO: helm-chart     # shared chart, values per environment, deployment PRs (release team)
+  SERVICE: my-app             # folder apps/my-app/ in helm-chart
   HELM_VERSION: v4.3.0
   DEPENDENCY_CHECK_VERSION: "13.0.0"
 
@@ -171,17 +174,24 @@ jobs:
       - name: Trivy image scan (HIGH/CRITICAL with a fix available fail)
         run: trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ECR_REPOSITORY:${{ steps.meta.outputs.tag }}"
 
-      # The same policies the cluster enforces, applied to the platform's chart with THIS image
-      - name: checkout platform policies and chart
+      # The same policies the cluster enforces (aws-platform), applied to the shared chart with my-app's values
+      # (helm-chart) and THIS image
+      - name: checkout platform policies
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PLATFORM_OWNER }}/${{ env.PLATFORM_REPO }}
           path: platform
+          sparse-checkout: policies/kyverno
+      - name: checkout chart and values
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_OWNER }}/${{ env.DEPLOY_REPO }}
+          path: deploy
       - name: Kyverno policies
         run: |
           for env in dev staging production; do
-            helm template my-app platform/helm/my-app -n "$env" \
-              -f "platform/gitops/apps/my-app/values-$env.yaml" \
+            helm template "$SERVICE" deploy/charts/microservice -n "$env" \
+              -f "deploy/apps/$SERVICE/values.yaml" -f "deploy/apps/$SERVICE/values-$env.yaml" \
               --set image.tag="${{ steps.meta.outputs.tag }}" > "rendered-$env.yaml"
             kyverno apply platform/policies/kyverno --resource "rendered-$env.yaml"
           done
@@ -222,10 +232,10 @@ jobs:
         if: vars.PLATFORM_APP_ID == ''
         run: |
           echo "::warning::GitHub App not configured (variable PLATFORM_APP_ID, secret PLATFORM_APP_PRIVATE_KEY)."
-          echo "Deploy by hand: set image.tag to ${{ needs.image.outputs.tag }} in gitops/apps/my-app/values-dev.yaml of $PLATFORM_OWNER/$PLATFORM_REPO" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy by hand: set image.tag to ${{ needs.image.outputs.tag }} in apps/$SERVICE/values-dev.yaml of $PLATFORM_OWNER/$DEPLOY_REPO" >> "$GITHUB_STEP_SUMMARY"
 
-      # Short-lived (1 hour) token of a GitHub App that may only write to aws-platform: no personal token stored.
-      # PRs opened with it also trigger platform-ci (PRs opened with GITHUB_TOKEN would not).
+      # Short-lived (1 hour) token of a GitHub App, limited here to helm-chart: no personal token stored.
+      # PRs opened with it also trigger helm-chart's ci (PRs opened with GITHUB_TOKEN would not).
       - id: app-token
         if: vars.PLATFORM_APP_ID != ''
         uses: actions/create-github-app-token@v2
@@ -233,29 +243,29 @@ jobs:
           app-id: ${{ vars.PLATFORM_APP_ID }}
           private-key: ${{ secrets.PLATFORM_APP_PRIVATE_KEY }}
           owner: ${{ env.PLATFORM_OWNER }}
-          repositories: ${{ env.PLATFORM_REPO }}
+          repositories: ${{ env.DEPLOY_REPO }}
 
       - if: vars.PLATFORM_APP_ID != ''
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.PLATFORM_OWNER }}/${{ env.PLATFORM_REPO }}
+          repository: ${{ env.PLATFORM_OWNER }}/${{ env.DEPLOY_REPO }}
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: open the dev pull request (merges itself when platform-ci passes; no approval needed for dev)
+      - name: open the dev pull request (merges itself when helm-chart ci passes; no approval needed for dev)
         if: vars.PLATFORM_APP_ID != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ needs.image.outputs.tag }}
         run: |
-          FILE=gitops/apps/my-app/values-dev.yaml
-          BRANCH="deploy/dev/my-app-$TAG"
-          REPO="$PLATFORM_OWNER/$PLATFORM_REPO"
+          FILE="apps/$SERVICE/values-dev.yaml"
+          BRANCH="deploy/dev/$SERVICE-$TAG"
+          REPO="$PLATFORM_OWNER/$DEPLOY_REPO"
 
-          # Newest tag wins: close dev deployment PRs that are still open for older tags
+          # Newest tag wins: close dev deployment PRs of THIS service that are still open for older tags
           for old in $(gh pr list -R "$REPO" --state open --json headRefName \
-                         --jq '.[].headRefName | select(startswith("deploy/dev/my-app-"))'); do
+                         --jq ".[].headRefName | select(test(\"^deploy/dev/$SERVICE-[0-9a-f]{7}\$\"))"); do
             [ "$old" = "$BRANCH" ] && continue
-            gh pr close "$old" -R "$REPO" --delete-branch --comment "Superseded by my-app $TAG"
+            gh pr close "$old" -R "$REPO" --delete-branch --comment "Superseded by $SERVICE $TAG"
           done
 
           sed -i -E "s/^(  tag: ).*/\1\"$TAG\"/" "$FILE"
@@ -266,13 +276,13 @@ jobs:
           git config user.name "${SLUG}[bot]"
           git config user.email "${BOT_ID}+${SLUG}[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git commit -am "deploy(dev): my-app $TAG"
+          git commit -am "deploy(dev): $SERVICE $TAG"
           git push --force origin "$BRANCH"
           gh pr create -R "$REPO" --base main --head "$BRANCH" \
-            --title "deploy(dev): my-app $TAG" \
+            --title "deploy(dev): $SERVICE $TAG" \
             --body "Automatic dev deployment of \`$ECR_REPOSITORY:$TAG\`.
-          Checks passed in my-app: Gitleaks, tests, SonarQube Cloud, dependencies, Trivy (fs + image), Kyverno.
+          Checks passed in $SERVICE: Gitleaks, tests, SonarQube Cloud, dependencies, Trivy (fs + image), Kyverno.
           Source: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-          Merges itself when platform-ci passes. After the sync, verify.yaml smoke-tests dev. Staging is released on purpose (release.yaml)."
+          Merges itself when ci passes. After the sync, verify.yaml smoke-tests dev. Staging is released on purpose (release.yaml)."
           gh pr merge "$BRANCH" -R "$REPO" --auto --squash --delete-branch
           echo "### Dev deployment PR opened for \`$TAG\` (auto-merge)" >> "$GITHUB_STEP_SUMMARY"

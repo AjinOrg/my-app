@@ -1,7 +1,8 @@
 # my-app
 
 Sample application for the AWS platform (EKS). A small Node.js HTTP service with **no runtime dependencies**.
-How it is deployed lives in the platform repository: `AjinOrg/aws-platform` (`helm/my-app`, `gitops/apps/my-app`).
+How it is deployed lives in `AjinOrg/helm-chart` (release team): the shared chart `charts/microservice` and this
+service's values in `apps/my-app/`. URL: `http://<alb>/<environment>/my-app`.
 
 ## Endpoints
 
@@ -50,9 +51,9 @@ docker run --rm -p 8080:8080 --read-only --cap-drop ALL my-app:local
 PR to main   → checks: Gitleaks, lint, tests + coverage, SonarQube Cloud quality gate, npm audit / OWASP,
                Trivy (fs + image), Kyverno  → must be green to merge
 merge to main → same checks → image pushed to ECR (tag = 7-char commit SHA, GitHub OIDC)
-             → dev:        PR in aws-platform merges itself after platform-ci, then smoke-tested (automatic)
-             → staging:    a person starts the release (form or menu) and picks a tag that ran in dev
-             → production: a person starts the release, picks a tag that ran in staging, and a Code Owner approves
+             → dev:        PR in helm-chart merges itself after its ci, then smoke-tested (automatic)
+             → staging:    the release team starts the release (form or menu) and picks a tag that ran in dev
+             → production: the release team starts the release, picks a tag that ran in staging, a Code Owner approves
 ```
-Details: `AjinOrg/aws-platform` README, "Step 11: Continuous Delivery". Run the tests with coverage locally:
+Details: `AjinOrg/helm-chart` README. Run the tests with coverage locally:
 `npm run test:coverage` (writes `coverage/lcov.info`, the file SonarQube Cloud reads).
